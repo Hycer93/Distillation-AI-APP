@@ -1,0 +1,507 @@
+蒸馏仔Agent体APP · 模块二：本地存储层（Room数据库）
+模块编号：M2
+
+模块名称：本地存储层（Room数据库）
+
+核心目标：创建完整的Room数据库及所有DAO，实现对话记录和闪念记忆的增删改查，并支持历史聊天记录的自动加载与恢复
+
+预计工时：1天
+
+前置依赖：M1（项目已可编译，API连接正常，Hilt依赖注入已配置）
+
+状态：⏳ 待开发
+
+产出物：完整的Room数据库，支持对话记录和闪念记忆的持久化存储，APP重启后对话历史自动恢复
+
+一、文件清单
+序号	文件路径	职责
+1	com.distillation.app.data.local.entity.ConversationEntity	会话实体
+2	com.distillation.app.data.local.entity.MessageEntity	消息实体
+3	com.distillation.app.data.local.entity.FlashMemoryEntity	闪念记忆实体
+4	com.distillation.app.data.local.dao.ConversationDao	会话DAO
+5	com.distillation.app.data.local.dao.MessageDao	消息DAO
+6	com.distillation.app.data.local.dao.FlashMemoryDao	闪念记忆DAO
+7	com.distillation.app.data.local.AppDatabase	Room数据库定义
+8	com.distillation.app.data.repository.ChatRepository	统一数据仓库
+二、核心数据表设计
+表名	核心字段	用途
+conversations	id, title, created_at	会话列表
+messages	id, conversation_id, role, content, timestamp	完整对话记录
+flash_memories	id, content, category, source, created_at	闪念记忆（精选层）
+三、开发步骤
+步骤1：创建Entity实体类（3个文件）
+1.1 会话实体
+kotlin
+package com.distillation.app.data.local.entity
+
+import androidx.room.Entity
+import androidx.room.PrimaryKey
+
+@Entity(tableName = "conversations")
+data class ConversationEntity(
+    @PrimaryKey
+    val id: String,
+    val title: String,
+    val createdAt: Long = System.currentTimeMillis()
+)
+1.2 消息实体
+kotlin
+package com.distillation.app.data.local.entity
+
+import androidx.room.Entity
+import androidx.room.ForeignKey
+import androidx.room.Index
+import androidx.room.PrimaryKey
+
+@Entity(
+    tableName = "messages",
+    foreignKeys = [
+        ForeignKey(
+            entity = ConversationEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["conversationId"],
+            onDelete = ForeignKey.CASCADE
+        )
+    ],
+    indices = [Index("timestamp")]
+)
+data class MessageEntity(
+    @PrimaryKey
+    val id: String,
+    val conversationId: String,
+    val role: String,          // "user" | "assistant" | "system"
+    val content: String,
+    val timestamp: Long = System.currentTimeMillis()
+)
+1.3 闪念记忆实体
+kotlin
+package com.distillation.app.data.local.entity
+
+import androidx.room.Entity
+import androidx.room.PrimaryKey
+
+@Entity(tableName = "flash_memories")
+data class FlashMemoryEntity(
+    @PrimaryKey
+    val id: String,
+    val content: String,
+    val category: String,      // 策略进化 / 技能淬炼 / 反面教材 / 关系里程碑 / 关键约定
+    val source: String = "",   // 来源对话ID，可为空
+    val createdAt: Long = System.currentTimeMillis()
+)
+步骤2：创建DAO接口（3个文件）
+2.1 会话DAO
+kotlin
+package com.distillation.app.data.local.dao
+
+import androidx.room.*
+import com.distillation.app.data.local.entity.ConversationEntity
+import kotlinx.coroutines.flow.Flow
+
+@Dao
+interface ConversationDao {
+    @Query("SELECT * FROM conversations ORDER BY createdAt DESC")
+    fun getAllConversations(): Flow<List<ConversationEntity>>
+
+    @Query("SELECT * FROM conversations WHERE id = :conversationId")
+    suspend fun getConversationById(conversationId: String): ConversationEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertConversation(conversation: ConversationEntity)
+
+    @Delete
+    suspend fun deleteConversation(conversation: ConversationEntity)
+
+    @Query("SELECT COUNT(*) FROM conversations")
+    suspend fun getConversationCount(): Int
+}
+2.2 消息DAO
+kotlin
+package com.distillation.app.data.local.dao
+
+import androidx.room.*
+import com.distillation.app.data.local.entity.MessageEntity
+import kotlinx.coroutines.flow.Flow
+
+@Dao
+interface MessageDao {
+    @Query("SELECT * FROM messages WHERE conversationId = :conversationId ORDER BY timestamp ASC")
+    fun getMessagesByConversation(conversationId: String): Flow<List<MessageEntity>>
+
+    @Query("SELECT * FROM messages ORDER BY timestamp DESC LIMIT :limit")
+    suspend fun getLatestMessages(limit: Int): List<MessageEntity>
+
+    @Query("SELECT * FROM messages WHERE conversationId = :conversationId ORDER BY timestamp ASC LIMIT :limit")
+    suspend fun getRecentMessages(conversationId: String, limit: Int): List<MessageEntity>
+
+    @Query("SELECT * FROM messages WHERE content LIKE '%' || :keyword || '%' ORDER BY timestamp DESC LIMIT :limit")
+    suspend fun searchByKeyword(keyword: String, limit: Int = 10): List<MessageEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertMessage(message: MessageEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertMessages(messages: List<MessageEntity>)
+
+    @Query("DELETE FROM messages WHERE timestamp < :beforeTimestamp")
+    suspend fun deleteMessagesBefore(beforeTimestamp: Long): Int
+
+    @Query("SELECT COUNT(*) FROM messages")
+    suspend fun getMessageCount(): Int
+}
+2.3 闪念记忆DAO
+kotlin
+package com.distillation.app.data.local.dao
+
+import androidx.room.*
+import com.distillation.app.data.local.entity.FlashMemoryEntity
+import kotlinx.coroutines.flow.Flow
+
+@Dao
+interface FlashMemoryDao {
+    @Query("SELECT * FROM flash_memories ORDER BY createdAt DESC")
+    fun getAllFlashMemories(): Flow<List<FlashMemoryEntity>>
+
+    @Query("SELECT * FROM flash_memories ORDER BY createdAt DESC LIMIT :limit")
+    suspend fun getLatest(limit: Int = 20): List<FlashMemoryEntity>
+
+    @Query("SELECT * FROM flash_memories WHERE category = :category ORDER BY createdAt DESC")
+    suspend fun getByCategory(category: String): List<FlashMemoryEntity>
+
+    @Query("SELECT * FROM flash_memories WHERE id = :id")
+    suspend fun getById(id: String): FlashMemoryEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertFlashMemory(memory: FlashMemoryEntity)
+
+    @Delete
+    suspend fun deleteFlashMemory(memory: FlashMemoryEntity)
+
+    @Query("DELETE FROM flash_memories WHERE id = :id")
+    suspend fun deleteById(id: String)
+
+    @Query("SELECT COUNT(*) FROM flash_memories")
+    suspend fun getCount(): Int
+
+    @Query("SELECT * FROM flash_memories ORDER BY createdAt ASC LIMIT 1")
+    suspend fun getOldest(): FlashMemoryEntity?
+}
+步骤3：创建Room数据库定义
+kotlin
+package com.distillation.app.data.local
+
+import androidx.room.Database
+import androidx.room.RoomDatabase
+import com.distillation.app.data.local.entity.ConversationEntity
+import com.distillation.app.data.local.entity.MessageEntity
+import com.distillation.app.data.local.entity.FlashMemoryEntity
+import com.distillation.app.data.local.dao.ConversationDao
+import com.distillation.app.data.local.dao.MessageDao
+import com.distillation.app.data.local.dao.FlashMemoryDao
+
+@Database(
+    entities = [
+        ConversationEntity::class,
+        MessageEntity::class,
+        FlashMemoryEntity::class
+    ],
+    version = 1,
+    exportSchema = false
+)
+abstract class AppDatabase : RoomDatabase() {
+    abstract fun conversationDao(): ConversationDao
+    abstract fun messageDao(): MessageDao
+    abstract fun flashMemoryDao(): FlashMemoryDao
+}
+步骤4：创建统一数据仓库
+kotlin
+package com.distillation.app.data.repository
+
+import com.distillation.app.data.local.dao.ConversationDao
+import com.distillation.app.data.local.dao.MessageDao
+import com.distillation.app.data.local.dao.FlashMemoryDao
+import com.distillation.app.data.local.entity.ConversationEntity
+import com.distillation.app.data.local.entity.MessageEntity
+import com.distillation.app.data.local.entity.FlashMemoryEntity
+import kotlinx.coroutines.flow.Flow
+import java.util.UUID
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class ChatRepository @Inject constructor(
+    private val conversationDao: ConversationDao,
+    private val messageDao: MessageDao,
+    private val flashMemoryDao: FlashMemoryDao
+) {
+    // ================= 会话管理 =================
+    fun getAllConversations(): Flow<List<ConversationEntity>> =
+        conversationDao.getAllConversations()
+
+    suspend fun getConversationById(conversationId: String): ConversationEntity? =
+        conversationDao.getConversationById(conversationId)
+
+    suspend fun createConversation(title: String = "新对话"): ConversationEntity {
+        val conversation = ConversationEntity(
+            id = UUID.randomUUID().toString(),
+            title = title,
+            createdAt = System.currentTimeMillis()
+        )
+        conversationDao.insertConversation(conversation)
+        return conversation
+    }
+
+    suspend fun deleteConversation(conversation: ConversationEntity) =
+        conversationDao.deleteConversation(conversation)
+
+    // ================= 消息管理 =================
+    fun getMessagesByConversation(conversationId: String): Flow<List<MessageEntity>> =
+        messageDao.getMessagesByConversation(conversationId)
+
+    suspend fun getLatestMessages(limit: Int = 20): List<MessageEntity> =
+        messageDao.getLatestMessages(limit)
+
+    suspend fun getRecentMessages(conversationId: String, limit: Int = 20): List<MessageEntity> {
+        return messageDao.getRecentMessages(conversationId, limit)
+    }
+
+    suspend fun searchMessagesByKeyword(keyword: String, limit: Int = 10): List<MessageEntity> =
+        messageDao.searchByKeyword(keyword, limit)
+
+    suspend fun saveMessage(
+        conversationId: String,
+        role: String,
+        content: String
+    ): MessageEntity {
+        val message = MessageEntity(
+            id = UUID.randomUUID().toString(),
+            conversationId = conversationId,
+            role = role,
+            content = content,
+            timestamp = System.currentTimeMillis()
+        )
+        messageDao.insertMessage(message)
+        return message
+    }
+
+    suspend fun saveMessages(messages: List<MessageEntity>) =
+        messageDao.insertMessages(messages)
+
+    suspend fun cleanupOldMessages(beforeTimestamp: Long): Int =
+        messageDao.deleteMessagesBefore(beforeTimestamp)
+
+    suspend fun getMessageCount(): Int =
+        messageDao.getMessageCount()
+
+    // ================= 闪念记忆管理 =================
+    fun getAllFlashMemories(): Flow<List<FlashMemoryEntity>> =
+        flashMemoryDao.getAllFlashMemories()
+
+    suspend fun getLatestFlashMemories(limit: Int = 20): List<FlashMemoryEntity> =
+        flashMemoryDao.getLatest(limit)
+
+    suspend fun getFlashMemoriesByCategory(category: String): List<FlashMemoryEntity> =
+        flashMemoryDao.getByCategory(category)
+
+    suspend fun saveFlashMemory(
+        content: String,
+        category: String,
+        source: String = ""
+    ): FlashMemoryEntity {
+        val memory = FlashMemoryEntity(
+            id = UUID.randomUUID().toString(),
+            content = content,
+            category = category,
+            source = source,
+            createdAt = System.currentTimeMillis()
+        )
+        flashMemoryDao.insertFlashMemory(memory)
+        return memory
+    }
+
+    suspend fun deleteFlashMemoryById(id: String) =
+        flashMemoryDao.deleteById(id)
+
+    suspend fun getFlashMemoryCount(): Int =
+        flashMemoryDao.getCount()
+}
+步骤5：更新ChatViewModel集成历史消息加载
+在M1已有的ChatViewModel基础上，新增历史消息加载逻辑。
+
+kotlin
+package com.distillation.app.ui.chat
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.distillation.app.data.api.ILLMProvider
+import com.distillation.app.data.api.Message
+import com.distillation.app.data.repository.ChatRepository
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+data class ChatUiState(
+    val messages: List<ChatMessage> = emptyList(),
+    val isLoading: Boolean = false
+)
+
+data class ChatMessage(
+    val role: String,
+    val content: String
+)
+
+@HiltViewModel
+class ChatViewModel @Inject constructor(
+    private val llmProvider: ILLMProvider,
+    private val chatRepository: ChatRepository     // 🆕 M2新增
+) : ViewModel() {
+
+    private val _uiState = MutableStateFlow(ChatUiState())
+    val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
+
+    private val conversationHistory = mutableListOf<Message>()
+
+    private var currentConversationId: String? = null
+
+    fun initConversation() {
+        viewModelScope.launch {
+            val conversation = chatRepository.createConversation("新对话")
+            currentConversationId = conversation.id
+            loadHistoryMessages()
+        }
+    }
+
+    private suspend fun loadHistoryMessages() {
+        val conversationId = currentConversationId ?: return
+        val recentMessages = chatRepository.getRecentMessages(conversationId, limit = 20)
+
+        if (recentMessages.isNotEmpty()) {
+            recentMessages.forEach { entity ->
+                conversationHistory.add(Message(entity.role, entity.content))
+            }
+            val chatMessages = recentMessages.map { entity ->
+                ChatMessage(entity.role, entity.content)
+            }
+            _uiState.value = _uiState.value.copy(messages = chatMessages)
+        }
+    }
+
+    fun sendMessage(userInput: String) {
+        if (userInput.isBlank()) return
+
+        if (currentConversationId == null) {
+            viewModelScope.launch {
+                initConversation()
+                doSendMessage(userInput)
+            }
+            return
+        }
+
+        viewModelScope.launch {
+            doSendMessage(userInput)
+        }
+    }
+
+    private suspend fun doSendMessage(userInput: String) {
+        val userMessage = ChatMessage("user", userInput)
+        _uiState.value = _uiState.value.copy(
+            messages = _uiState.value.messages + userMessage,
+            isLoading = true
+        )
+
+        conversationHistory.add(Message("user", userInput))
+
+        if (currentConversationId != null) {
+            chatRepository.saveMessage(currentConversationId!!, "user", userInput)
+        }
+
+        try {
+            val reply = llmProvider.chat(conversationHistory.toList())
+            val aiMessage = ChatMessage("assistant", reply)
+            _uiState.value = _uiState.value.copy(
+                messages = _uiState.value.messages + aiMessage,
+                isLoading = false
+            )
+            conversationHistory.add(Message("assistant", reply))
+
+            if (currentConversationId != null) {
+                chatRepository.saveMessage(currentConversationId!!, "assistant", reply)
+            }
+        } catch (e: Exception) {
+            val errorMessage = ChatMessage(
+                "assistant",
+                "连接出了点问题：${e.message}"
+            )
+            _uiState.value = _uiState.value.copy(
+                messages = _uiState.value.messages + errorMessage,
+                isLoading = false
+            )
+        }
+    }
+
+    fun clearConversation() {
+        conversationHistory.clear()
+        _uiState.value = ChatUiState()
+        currentConversationId = null
+    }
+}
+步骤6：更新Hilt依赖注入模块
+在M1已有的AppModule基础上，新增Room数据库及所有DAO的注入方法。
+
+kotlin
+// ================= Room数据库（M2新增） =================
+@Provides
+@Singleton
+fun provideAppDatabase(@ApplicationContext context: Context): AppDatabase {
+    return Room.databaseBuilder(
+        context,
+        AppDatabase::class.java,
+        "distillation_app_db"
+    ).build()
+}
+
+@Provides
+@Singleton
+fun provideConversationDao(db: AppDatabase): ConversationDao = db.conversationDao()
+
+@Provides
+@Singleton
+fun provideMessageDao(db: AppDatabase): MessageDao = db.messageDao()
+
+@Provides
+@Singleton
+fun provideFlashMemoryDao(db: AppDatabase): FlashMemoryDao = db.flashMemoryDao()
+四、验收标准
+序号	验收项	通过条件
+1	数据库编译	Room注解处理器无报错，AppDatabase可正常创建
+2	DAO操作	插入、查询、删除闪念记忆和消息均正确执行
+3	数据持久化	APP重启后，之前保存的数据仍可查询
+4	关键词检索	按关键词搜索消息，返回正确结果
+5	Flow响应	数据变化时，Flow正确通知观察者
+6	线程安全	所有DAO操作通过协程在后台线程正确执行
+7	Repository统一入口	ChatRepository正确调度三个DAO，对外暴露统一API
+8	历史对话加载	APP重启后，之前会话的对话历史自动显示在界面上
+五、开发前提
+在M1已有的build.gradle.kts中，Room相关依赖已经包含（room-runtime、room-compiler、room-ktx各2.6.0版本）。如果M1开发时已按架构文档正确配置，本模块无需额外添加依赖。
+
+检查清单：
+
+implementation("androidx.room:room-runtime:2.6.0") 已存在
+
+ksp("androidx.room:room-compiler:2.6.0") 已存在（注意用 ksp 而非 kapt）
+
+implementation("androidx.room:room-ktx:2.6.0") 已存在
+
+六、注意事项
+KSP注解处理：M1已确认使用KSP替代kapt，Room编译器也应使用KSP方式声明。
+
+数据库版本管理：当前version = 1。后续若需新增表或修改字段，需提供迁移策略或使用fallbackToDestructiveMigration()。
+
+线程安全：所有DAO方法默认为suspend或返回Flow，Room自动在后台线程执行。
+
+闪念记忆上限：目前未做硬性上限，后续M4记忆复活模块会实现容量管理和自动降级逻辑。
+
+历史消息加载顺序：先加载System Prompt（M3模块），再加载历史对话记录（本模块），最后发送新消息。确保LLM API的对话历史中，system消息始终排在第一位

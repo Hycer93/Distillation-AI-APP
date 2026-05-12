@@ -1,0 +1,383 @@
+蒸馏仔Agent体APP · 模块三：人格加载系统（修正版）
+模块编号：M3
+
+模块名称：人格加载系统
+
+核心目标：启动时从assets/加载出厂设置等核心文件，拼装成完整System Prompt并与用户消息一起发送
+
+预计工时：1-2天
+
+前置依赖：M1（API连接层）、M2（Room数据库）
+
+状态：⏳ 待开发
+
+产出物：完整的System Prompt拼装管道，每次API请求自动注入蒸馏仔人格
+
+一、文件清单
+序号	文件路径	职责
+1	assets/蒸馏仔_出厂设置.md	最高优先级人格定义（只读）
+2	assets/蒸馏仔_人格表达系统_V1.0.md	语言、情绪、热梗规范（只读）
+3	assets/数字熔炉策略手册_V3.5.md	完整规则库（只读）
+4	assets/出厂知识_核心认知资产.md	16条底层基线（只读）
+5	assets/skills/目录下全部21个文件	16个Skill + 5个元Skill（只读）
+6	com.distillation.app.data.persona.PersonaConfig	版本号管理
+7	com.distillation.app.data.persona.PersonaManager	System Prompt组装（三段式拼装）
+8	com.distillation.app.ui.chat.ChatViewModel	更新：集成PersonaManager
+二、开发步骤
+步骤1：准备Asset资源文件
+将以下文件放入 app/src/main/assets/ 目录下。这些文件在APK打包后只读，不随对话更新。
+
+步骤2：创建人格配置管理类
+kotlin
+package com.distillation.app.data.persona
+
+import android.content.Context
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKeys
+import dagger.hilt.android.qualifiers.ApplicationContext
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class PersonaConfig @Inject constructor(
+    @ApplicationContext private val context: Context
+) {
+    private val prefs by lazy {
+        EncryptedSharedPreferences.create(
+            "persona_config",
+            MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC),
+            context,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+        )
+    }
+
+    fun getVersion(): String {
+        return prefs.getString("persona_version", "V1.0") ?: "V1.0"
+    }
+
+    fun setVersion(version: String) {
+        prefs.edit().putString("persona_version", version).apply()
+    }
+
+    fun getCustomRules(): String {
+        return prefs.getString("custom_rules", "") ?: ""
+    }
+
+    fun setCustomRules(rules: String) {
+        prefs.edit().putString("custom_rules", rules).apply()
+    }
+}
+步骤3：创建核心的人格管理器（三段式拼装）
+kotlin
+package com.distillation.app.data.persona
+
+import android.content.Context
+import com.distillation.app.data.local.dao.FlashMemoryDao
+import dagger.hilt.android.qualifiers.ApplicationContext
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class PersonaManager @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val flashMemoryDao: FlashMemoryDao,
+    private val personaConfig: PersonaConfig
+) {
+    private var cachedCorePersona: String? = null
+    private var cachedStrategySummary: String? = null
+
+    /**
+     * 核心方法：组装完整System Prompt
+     * 三段式拼装：
+     *   第一段 - 静态核心：出厂设置（完整）
+     *   第二段 - 规则摘要：策略手册核心条款（压缩版）
+     *   第三段 - 动态成长：闪念记忆
+     */
+    suspend fun assembleSystemPrompt(): String {
+        val sb = StringBuilder()
+
+        // 第一段：静态核心（从Asset加载，首次加载后缓存）
+        sb.appendLine(loadCorePersona())
+        sb.appendLine()
+
+        // 第二段：规则摘要（从Asset加载，首次加载后缓存）
+        sb.appendLine(loadStrategySummary())
+        sb.appendLine()
+
+        // 第三段：动态成长（从Room数据库读取闪念记忆）
+        sb.appendLine(loadDynamicGrowth())
+        sb.appendLine()
+
+        // 版本信息
+        sb.appendLine("【人格版本】${personaConfig.getVersion()}")
+
+        // 自定义规则（如果有）
+        val customRules = personaConfig.getCustomRules()
+        if (customRules.isNotBlank()) {
+            sb.appendLine("\n【自定义规则】")
+            sb.appendLine(customRules)
+        }
+
+        return sb.toString()
+    }
+
+    /**
+     * 第一段：加载出厂设置（完整版）
+     */
+    private fun loadCorePersona(): String {
+        if (cachedCorePersona == null) {
+            val core = StringBuilder()
+            core.appendLine(
+                context.assets.open("蒸馏仔_出厂设置.md")
+                    .bufferedReader().use { it.readText() }
+            )
+            core.appendLine()
+            try {
+                core.appendLine(
+                    context.assets.open("蒸馏仔_人格表达系统_V1.0.md")
+                        .bufferedReader().use { it.readText() }
+                )
+            } catch (e: Exception) {
+                core.appendLine("【人格表达系统】加载失败，使用默认语言风格")
+            }
+            cachedCorePersona = core.toString()
+        }
+        return cachedCorePersona!!
+    }
+
+    /**
+     * 第二段：加载策略手册核心条款（压缩版）
+     */
+    private fun loadStrategySummary(): String {
+        if (cachedStrategySummary == null) {
+            val summary = StringBuilder()
+            summary.appendLine("【核心规则摘要】")
+            try {
+                val fullStrategy = context.assets.open("数字熔炉策略手册_V3.5.md")
+                    .bufferedReader().use { it.readText() }
+                val lines = fullStrategy.lines()
+                summary.appendLine(lines.take(200).joinToString("\n"))
+                summary.appendLine()
+                summary.appendLine("...（完整策略手册已加载，此处为核心摘要）")
+            } catch (e: Exception) {
+                summary.appendLine("【策略手册】加载失败")
+            }
+            try {
+                summary.appendLine()
+                summary.appendLine(
+                    context.assets.open("出厂知识_核心认知资产.md")
+                        .bufferedReader().use { it.readText() }
+                )
+            } catch (e: Exception) {
+                // 忽略，非致命错误
+            }
+            cachedStrategySummary = summary.toString()
+        }
+        return cachedStrategySummary!!
+    }
+
+    /**
+     * 第三段：加载动态成长数据（闪念记忆）
+     */
+    private suspend fun loadDynamicGrowth(): String {
+        val sb = StringBuilder()
+        val flashMemories = flashMemoryDao.getLatest(20)
+        if (flashMemories.isNotEmpty()) {
+            sb.appendLine("【成长记忆·闪念】")
+            flashMemories.forEach { memory ->
+                sb.appendLine("- [${memory.category}] ${memory.content}")
+            }
+            sb.appendLine()
+        }
+        return sb.toString()
+    }
+
+    fun getAssetFileList(): List<String> {
+        return try {
+            context.assets.list("skills/")?.map { "skills/$it" } ?: emptyList()
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    fun clearCache() {
+        cachedCorePersona = null
+        cachedStrategySummary = null
+    }
+}
+步骤4：更新ChatViewModel以集成PersonaManager
+在M2已有的ChatViewModel基础上，注入PersonaManager并在sendMessage()中拼装System Prompt。
+
+kotlin
+package com.distillation.app.ui.chat
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.distillation.app.data.api.ILLMProvider
+import com.distillation.app.data.api.Message
+import com.distillation.app.data.persona.PersonaManager
+import com.distillation.app.data.repository.ChatRepository
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+data class ChatUiState(
+    val messages: List<ChatMessage> = emptyList(),
+    val isLoading: Boolean = false
+)
+
+data class ChatMessage(
+    val role: String,
+    val content: String
+)
+
+@HiltViewModel
+class ChatViewModel @Inject constructor(
+    private val llmProvider: ILLMProvider,
+    private val personaManager: PersonaManager,    // 🆕 M3新增
+    private val chatRepository: ChatRepository     // M2已有
+) : ViewModel() {
+
+    private val _uiState = MutableStateFlow(ChatUiState())
+    val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
+
+    private val conversationHistory = mutableListOf<Message>()
+
+    private var systemPromptLoaded = false
+    private var currentConversationId: String? = null
+
+    fun initConversation() {
+        viewModelScope.launch {
+            val conversation = chatRepository.createConversation("新对话")
+            currentConversationId = conversation.id
+            loadHistoryMessages()
+
+            if (!systemPromptLoaded) {
+                val systemPrompt = personaManager.assembleSystemPrompt()
+                conversationHistory.add(0, Message("system", systemPrompt))
+                systemPromptLoaded = true
+            }
+        }
+    }
+
+    private suspend fun loadHistoryMessages() {
+        val conversationId = currentConversationId ?: return
+        val recentMessages = chatRepository.getRecentMessages(conversationId, limit = 20)
+
+        if (recentMessages.isNotEmpty()) {
+            recentMessages.forEach { entity ->
+                conversationHistory.add(Message(entity.role, entity.content))
+            }
+            val chatMessages = recentMessages.map { entity ->
+                ChatMessage(entity.role, entity.content)
+            }
+            _uiState.value = _uiState.value.copy(messages = chatMessages)
+        }
+    }
+
+    fun sendMessage(userInput: String) {
+        if (userInput.isBlank()) return
+
+        if (!systemPromptLoaded) {
+            viewModelScope.launch {
+                initConversation()
+                doSendMessage(userInput)
+            }
+            return
+        }
+
+        viewModelScope.launch {
+            doSendMessage(userInput)
+        }
+    }
+
+    private suspend fun doSendMessage(userInput: String) {
+        val userMessage = ChatMessage("user", userInput)
+        _uiState.value = _uiState.value.copy(
+            messages = _uiState.value.messages + userMessage,
+            isLoading = true
+        )
+
+        conversationHistory.add(Message("user", userInput))
+
+        if (currentConversationId != null) {
+            chatRepository.saveMessage(currentConversationId!!, "user", userInput)
+        }
+
+        try {
+            val reply = llmProvider.chat(conversationHistory.toList())
+            val aiMessage = ChatMessage("assistant", reply)
+            _uiState.value = _uiState.value.copy(
+                messages = _uiState.value.messages + aiMessage,
+                isLoading = false
+            )
+            conversationHistory.add(Message("assistant", reply))
+
+            if (currentConversationId != null) {
+                chatRepository.saveMessage(currentConversationId!!, "assistant", reply)
+            }
+        } catch (e: Exception) {
+            val errorMessage = ChatMessage(
+                "assistant",
+                "连接出了点问题：${e.message}"
+            )
+            _uiState.value = _uiState.value.copy(
+                messages = _uiState.value.messages + errorMessage,
+                isLoading = false
+            )
+        }
+    }
+
+    fun clearConversation() {
+        conversationHistory.clear()
+        _uiState.value = ChatUiState()
+        systemPromptLoaded = false
+        currentConversationId = null
+    }
+}
+步骤5：更新MainActivity以触发初始化
+kotlin
+package com.distillation.app
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.viewModels
+import com.distillation.app.ui.chat.ChatScreen
+import com.distillation.app.ui.chat.ChatViewModel
+import dagger.hilt.android.AndroidEntryPoint
+
+@AndroidEntryPoint
+class MainActivity : ComponentActivity() {
+
+    private val chatViewModel: ChatViewModel by viewModels()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        chatViewModel.initConversation()
+        setContent {
+            MaterialTheme {
+                ChatScreen(viewModel = chatViewModel)
+            }
+        }
+    }
+}
+三、验收标准
+序号	验收项	通过条件
+1	Asset加载	启动APP后，PersonaManager.assembleSystemPrompt()返回包含出厂设置在内的完整文本
+2	缓存机制	首次加载后，再次调用assembleSystemPrompt()不重复读取Asset文件
+3	System Prompt注入	发送消息时，API请求的messages[0].role为"system"，内容包含出厂设置
+4	闪念记忆注入	System Prompt中包含通过FlashMemoryDao读取的最新闪念记忆
+5	版本信息	System Prompt末尾包含【人格版本】V1.0
+6	自定义规则	通过PersonaConfig设置自定义规则后，System Prompt中包含对应内容
+7	异常容错	任一Asset文件加载失败时，不影响APP正常启动和对话
+四、注意事项
+Asset文件大小控制：当前核心文件总大小约170KB，加上Skill文件约120KB，总Asset大小约280KB。在1M Token上限下，仅占约20-30%空间。
+
+缓存更新时机：Asset资源随APP版本更新而更新，当APP升级时cachedCorePersona会自动失效。如需运行时重新加载，可在SettingsScreen提供"重新加载人格"按钮调用clearCache()。
+
+Asset目录读取：所有文件写入assets/目录后需通过context.assets.open()读取，避免使用File API直接访问。

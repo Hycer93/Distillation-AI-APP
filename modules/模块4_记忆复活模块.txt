@@ -1,0 +1,480 @@
+蒸馏仔Agent体APP · 模块四：记忆复活模块
+"以下模块的开发基于之前已完成的代码。当前项目已可编译运行，API连接层测试通过。请在本模块的代码中添加新功能，不要修改已有功能的核心逻辑。所有新代码请标注// 🆕 Mx新增注释，以区分已有代码。"
+模块元数据
+模块编号：M4
+
+模块名称：记忆复活模块
+
+核心目标：新会话启动时自动注入记忆摘要，用户明确触发时检索历史记录
+
+预计工时：1天
+
+前置依赖：M1（API连接层）、M2（Room数据库）、M3（人格加载系统）
+
+产出物：完整的记忆协同机制，实现“上下文优先、数据库兜底”
+
+一、文件清单
+序号	文件路径	职责
+1	com.distillation.app.data.persona.MemoryReviver	记忆复活提示词拼装
+2	com.distillation.app.data.persona.ContextManager	上下文Token管理+滑动窗口裁剪
+3	com.distillation.app.ui.chat.ChatViewModel	更新：集成记忆检索触发逻辑
+4	com.distillation.app.di.AppModule	更新：添加ContextManager注入
+二、核心设计原理
+2.1 两种触发策略
+策略	触发时机	实现方式	成本
+主动注入	每次新会话启动时	MemoryReviver自动拼装记忆摘要注入System Prompt	极低
+显式触发	用户输入包含明确回溯词时	硬编码触发词 → 从Room DB检索历史消息 → 注入当前上下文	低
+2.2 核心原则
+上下文优先：大模型输入的上下文窗口是唯一直接输入源
+
+数据库兜底：仅在用户明确回溯时检索本地Room数据库
+
+单向管道：对话存入数据库是自动的，从数据库取回记忆由显式触发或新会话注入
+
+三、开发步骤
+步骤1：创建记忆复活器
+com.distillation.app.data.persona.MemoryReviver
+
+kotlin
+package com.distillation.app.data.persona
+
+import com.distillation.app.data.local.dao.FlashMemoryDao
+import com.distillation.app.data.local.dao.MessageDao
+import com.distillation.app.data.local.dao.PortfolioDao
+import com.distillation.app.data.local.entity.FlashMemoryEntity
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class MemoryReviver @Inject constructor(
+    private val flashMemoryDao: FlashMemoryDao,
+    private val messageDao: MessageDao
+) {
+    /**
+     * 核心方法：生成“记忆复活提示词”
+     * 在新会话启动时调用，拼装当前状态摘要注入System Prompt
+     */
+    suspend fun generateRevivePrompt(): String {
+        val sb = StringBuilder()
+        sb.appendLine("【记忆复苏·当前状态】")
+
+
+        // 1. 核心共识（关键约定类闪念记忆）
+        val agreements = flashMemoryDao.getByCategory("关键约定")
+        if (agreements.isNotEmpty()) {
+            sb.appendLine("\n💎 核心共识：")
+            agreements.forEach { memory ->
+                sb.appendLine("  - ${memory.content}")
+            }
+        }
+
+        // 2. 最新操作指令（最近5条闪念记忆中非约定类的）
+        val latestFlash = flashMemoryDao.getLatest(5)
+        val actionItems = latestFlash.filter { it.category != "关键约定" }
+        if (actionItems.isNotEmpty()) {
+            sb.appendLine("\n📋 最近关键事件：")
+            actionItems.forEach { memory ->
+                sb.appendLine("  - [${memory.category}] ${memory.content}")
+            }
+        }
+
+        // 3. 最近对话摘要（最近3轮对话的简要上下文）
+        val recentMessages = messageDao.getLatestMessages(6)  // 最近6条消息（3轮对话）
+        if (recentMessages.isNotEmpty()) {
+            sb.appendLine("\n💬 最近对话：")
+            recentMessages.forEach { msg ->
+                val roleLabel = when (msg.role) {
+                    "user" -> "厂长"
+                    "assistant" -> "蒸馏仔"
+                    else -> msg.role
+                }
+                val preview = if (msg.content.length > 100) {
+                    msg.content.take(100) + "..."
+                } else {
+                    msg.content
+                }
+                sb.appendLine("  [$roleLabel] $preview")
+            }
+        }
+
+        sb.appendLine("\n记忆复苏完成，等待厂长指令。")
+        return sb.toString()
+    }
+
+    /**
+     * 获取用于注入System Prompt的闪念记忆摘要
+     * 用于PersonaManager的三段式拼装
+     */
+    suspend fun getFlashMemorySummary(limit: Int = 20): String {
+        val memories = flashMemoryDao.getLatest(limit)
+        if (memories.isEmpty()) return ""
+
+        val sb = StringBuilder()
+        sb.appendLine("【成长记忆·闪念】")
+        memories.forEach { memory ->
+            sb.appendLine("- [${memory.category}] ${memory.content}")
+        }
+        return sb.toString()
+    }
+}
+步骤2：创建上下文管理器
+com.distillation.app.data.persona.ContextManager
+
+kotlin
+package com.distillation.app.data.persona
+
+import com.distillation.app.data.api.Message
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * 上下文管理器
+ * 职责：
+ * 1. 维护当前会话的消息队列
+ * 2. 实时估算Token用量
+ * 3. 超过上限时自动裁剪最早的消息片段
+ * 4. 输出裁剪日志
+ */
+@Singleton
+class ContextManager @Inject constructor() {
+
+    companion object {
+        /** 上下文最大Token数（1M Token，预留安全边际取800K） */
+        const val MAX_TOKENS = 800_000
+
+        /** 单个Token约对应字符数（中文经验值，1 Token ≈ 0.4字符） */
+        const val CHARS_PER_TOKEN = 0.4
+    }
+
+    // 消息队列（有序，按添加顺序排列）
+    private val messageQueue = ArrayDeque<Message>()
+
+    // 当前估算Token用量
+    private var currentTokens: Int = 0
+
+    // 裁剪次数统计
+    private var trimCount: Int = 0
+
+    // 裁剪日志
+    private val _trimLog = MutableStateFlow<List<TrimLogEntry>>(emptyList())
+    val trimLog: StateFlow<List<TrimLogEntry>> = _trimLog.asStateFlow()
+
+    data class TrimLogEntry(
+        val timestamp: Long,
+        val trimmedTokens: Int,
+        val remainingMessages: Int,
+        val currentTokens: Int
+    )
+
+    /**
+     * 添加一条消息到上下文
+     * 如果超过Token上限，自动裁剪最早的消息片段
+     */
+    fun addMessage(message: Message) {
+        val tokens = calculateTokens(message.content)
+        messageQueue.addLast(message)
+        currentTokens += tokens
+
+        // 超过上限，滑动窗口裁剪最早消息（保留至少1条消息）
+        while (currentTokens > MAX_TOKENS && messageQueue.size > 1) {
+            val removed = messageQueue.removeFirst()
+            val removedTokens = calculateTokens(removed.content)
+            currentTokens -= removedTokens
+            trimCount++
+
+            // 记录裁剪日志
+            val entry = TrimLogEntry(
+                timestamp = System.currentTimeMillis(),
+                trimmedTokens = removedTokens,
+                remainingMessages = messageQueue.size,
+                currentTokens = currentTokens
+            )
+            _trimLog.value = _trimLog.value + entry
+        }
+    }
+
+    /**
+     * 获取当前上下文（返回消息列表的副本）
+     */
+    fun getCurrentContext(): List<Message> {
+        return messageQueue.toList()
+    }
+
+    /**
+     * 获取当前Token用量
+     */
+    fun getCurrentTokenCount(): Int = currentTokens
+
+    /**
+     * 获取裁剪次数
+     */
+    fun getTrimCount(): Int = trimCount
+
+    /**
+     * 估算文本Token数
+     * 中文经验值：1 Token ≈ 0.4字符
+     */
+    fun calculateTokens(text: String): Int {
+        return (text.length * CHARS_PER_TOKEN).toInt().coerceAtLeast(1)
+    }
+
+    /**
+     * 清除当前上下文（新会话时调用）
+     */
+    fun clearContext() {
+        messageQueue.clear()
+        currentTokens = 0
+        trimCount = 0
+        _trimLog.value = emptyList()
+    }
+
+    /**
+     * 获取当前上下文统计信息
+     */
+    fun getContextStats(): ContextStats {
+        return ContextStats(
+            messageCount = messageQueue.size,
+            currentTokens = currentTokens,
+            maxTokens = MAX_TOKENS,
+            usagePercent = (currentTokens.toDouble() / MAX_TOKENS * 100).toInt(),
+            trimCount = trimCount
+        )
+    }
+
+    data class ContextStats(
+        val messageCount: Int,
+        val currentTokens: Int,
+        val maxTokens: Int,
+        val usagePercent: Int,
+        val trimCount: Int
+    )
+}
+步骤3：更新ChatViewModel集成记忆检索触发逻辑
+在M1/M3已有的ChatViewModel基础上，新增记忆复活和显式触发检索逻辑。
+
+com.distillation.app.ui.chat.ChatViewModel（在M3版本基础上追加以下内容）
+
+kotlin
+package com.distillation.app.ui.chat
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.distillation.app.data.api.ILLMProvider
+import com.distillation.app.data.api.Message
+import com.distillation.app.data.local.entity.MessageEntity
+import com.distillation.app.data.persona.ContextManager
+import com.distillation.app.data.persona.MemoryReviver
+import com.distillation.app.data.persona.PersonaManager
+import com.distillation.app.data.repository.ChatRepository
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+data class ChatUiState(
+    val messages: List<ChatMessage> = emptyList(),
+    val isLoading: Boolean = false,
+    val contextStats: ContextManager.ContextStats = ContextManager.ContextStats(0, 0, 0, 0, 0)
+)
+
+data class ChatMessage(
+    val role: String,
+    val content: String
+)
+
+@HiltViewModel
+class ChatViewModel @Inject constructor(
+    private val llmProvider: ILLMProvider,
+    private val personaManager: PersonaManager,
+    private val chatRepository: ChatRepository,
+    private val memoryReviver: MemoryReviver,        // 🆕 M4新增
+    private val contextManager: ContextManager        // 🆕 M4新增
+) : ViewModel() {
+
+    private val _uiState = MutableStateFlow(ChatUiState())
+    val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
+
+    private var systemPromptLoaded = false
+    private var currentConversationId: String? = null
+
+    // 🆕 显式回溯触发词列表
+    private val memoryTriggerWords = listOf(
+        "之前", "上次", "记得", "说过", "讨论过",
+        "翻一下", "回顾", "历史", "以前", "那时候"
+    )
+
+    /**
+     * 🆕 初始化会话（注入System Prompt + 记忆复活提示词）
+     */
+    fun initConversation() {
+        viewModelScope.launch {
+            // 创建新会话
+            val conversation = chatRepository.createConversation("新对话")
+            currentConversationId = conversation.id
+
+            // 清除旧的上下文
+            contextManager.clearContext()
+
+            // 加载System Prompt
+            if (!systemPromptLoaded) {
+                val systemPrompt = personaManager.assembleSystemPrompt()
+
+                // 🆕 追加记忆复活提示词
+                val revivePrompt = memoryReviver.generateRevivePrompt()
+                val fullSystemPrompt = "$systemPrompt\n\n$revivePrompt"
+
+                val systemMessage = Message("system", fullSystemPrompt)
+                contextManager.addMessage(systemMessage)
+                systemPromptLoaded = true
+            }
+        }
+    }
+
+    fun sendMessage(userInput: String) {
+        if (userInput.isBlank()) return
+
+        if (!systemPromptLoaded) {
+            viewModelScope.launch {
+                initConversation()
+                doSendMessage(userInput)
+            }
+            return
+        }
+
+        viewModelScope.launch {
+            // 🆕 检查是否需要显式触发记忆检索
+            if (shouldRetrieveMemory(userInput)) {
+                val historyMessages = retrieveHistoryMemory(userInput)
+                if (historyMessages.isNotEmpty()) {
+                    // 将检索到的历史记忆注入上下文
+                    val memoryContext = buildString {
+                        appendLine("【历史记忆检索结果】")
+                        historyMessages.forEach { msg ->
+                            val roleLabel = when (msg.role) {
+                                "user" -> "厂长"
+                                "assistant" -> "蒸馏仔"
+                                else -> msg.role
+                            }
+                            val preview = if (msg.content.length > 200) {
+                                msg.content.take(200) + "..."
+                            } else {
+                                msg.content
+                            }
+                            appendLine("[$roleLabel] $preview")
+                        }
+                        appendLine()
+                    }
+                    contextManager.addMessage(Message("system", memoryContext))
+                }
+            }
+
+            doSendMessage(userInput)
+        }
+    }
+
+    private suspend fun doSendMessage(userInput: String) {
+        // 添加用户消息到界面
+        val userMessage = ChatMessage("user", userInput)
+        _uiState.value = _uiState.value.copy(
+            messages = _uiState.value.messages + userMessage,
+            isLoading = true
+        )
+
+        // 添加到上下文管理器
+        val userMsg = Message("user", userInput)
+        contextManager.addMessage(userMsg)
+
+        // 异步保存用户消息到数据库
+        if (currentConversationId != null) {
+            chatRepository.saveMessage(currentConversationId!!, "user", userInput)
+        }
+
+        try {
+            // 调用API（使用上下文管理器中的消息）
+            val contextMessages = contextManager.getCurrentContext()
+            val reply = llmProvider.chat(contextMessages)
+
+            val aiMessage = ChatMessage("assistant", reply)
+            _uiState.value = _uiState.value.copy(
+                messages = _uiState.value.messages + aiMessage,
+                isLoading = false,
+                contextStats = contextManager.getContextStats()
+            )
+
+            // 添加到上下文管理器
+            contextManager.addMessage(Message("assistant", reply))
+
+            // 异步保存AI回复到数据库
+            if (currentConversationId != null) {
+                chatRepository.saveMessage(currentConversationId!!, "assistant", reply)
+            }
+        } catch (e: Exception) {
+            val errorMessage = ChatMessage(
+                "assistant",
+                "厂长，连接出了点问题：${e.message}"
+            )
+            _uiState.value = _uiState.value.copy(
+                messages = _uiState.value.messages + errorMessage,
+                isLoading = false
+            )
+        }
+    }
+
+    /**
+     * 🆕 判断是否需要显式触发记忆检索
+     */
+    private fun shouldRetrieveMemory(userInput: String): Boolean {
+        return memoryTriggerWords.any { triggerWord ->
+            userInput.contains(triggerWord)
+        }
+    }
+
+    /**
+     * 🆕 从本地数据库检索历史记忆
+     */
+    private suspend fun retrieveHistoryMemory(keyword: String): List<MessageEntity> {
+        return chatRepository.searchMessagesByKeyword(keyword, limit = 5)
+    }
+
+    fun clearConversation() {
+        contextManager.clearContext()
+        _uiState.value = ChatUiState()
+        systemPromptLoaded = false
+        currentConversationId = null
+    }
+}
+步骤4：更新Hilt依赖注入模块
+在M1/M2已有的AppModule中，添加ContextManager的单例注入。
+
+com.distillation.app.di.AppModule（在原有基础上追加以下内容）
+
+kotlin
+// 🆕 M4新增：上下文管理器
+@Provides
+@Singleton
+fun provideContextManager(): ContextManager = ContextManager()
+四、验收标准
+序号	验收项	通过条件
+1	新会话注入	新建会话后，System Prompt自动包含“【记忆复苏·当前状态】”内容
+2	持仓注入	记忆复活提示词中包含最新持仓快照
+3	闪念注入	记忆复活提示词中包含关键约定类闪念记忆
+4	显式触发	发送包含“之前”、“上次”等关键词的消息时，从数据库检索历史并注入上下文
+5	历史检索结果	检索到的历史消息以“【历史记忆检索结果】”格式注入System Prompt
+6	上下文裁剪	对话过长时，ContextManager自动裁剪最早的消息片段
+7	Token统计	contextStats正确反映当前消息数量和Token使用百分比
+8	裁剪日志	trimLog正确记录每次裁剪的Token数量和剩余消息数
+9	异常容错	数据库为空时，MemoryReviver不崩溃，只输出基本提示词
+10	会话隔离	不同会话之间的上下文互不影响
+五、注意事项
+Token估算精度：当前使用字符数 × 0.4的近似算法。这是工程上的折中方案，因为客户端无法获取API实际返回的usage字段。中文场景下误差可接受，后续端侧推理上线后可替换为精确计数。
+
+裁剪时机：裁剪仅在Token超标时触发，不是每次提问都执行。这避免了误伤当前轮次关联的历史片段。
+
+历史检索去重：当前版本对数据库检索结果不做语义去重（需要本地小模型）。如果检索结果与上下文已有内容重复，会占用额外空间。后续V1.0版本可通过本地规则引擎优化。
+
+触发词列表：当前memoryTriggerWords是硬编码的静态列表。如果后续需要更灵活的语义判断，可替换为本地规则引擎或轻量级意图识别模型。
