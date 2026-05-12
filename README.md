@@ -1,3 +1,6 @@
+
+
+
 # 蒸馏仔 Distillation-AI-APP
 
 
@@ -28,7 +31,7 @@
 - 自研三段式认知基座
 
 ## 演示视频
-后续演示视频会放在此处，展示记忆复苏、人格交互、会话连续性等核心能力。
+https://github.com/user-attachments/assets/b9f371a9-c722-4526-bc4d-df9fdf8b7ebe
 
 ## 开源协议
 本项目基于 **Apache License 2.0** 开源。
@@ -37,4 +40,6 @@
 
 ## 作者
 归元仔
+
+
 移动端 AI 智能体 / 八层认知思维框架 / DFCP 协议架构设计者
